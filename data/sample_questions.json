@@ -1,0 +1,52 @@
+{
+  "title": "GATE CSE sample practice (illustrative questions)",
+  "questions": [
+    {
+      "id": "q1",
+      "type": "MCQ",
+      "subject": "Algorithms",
+      "question": "Which data structure is typically used to implement a breadth-first search (BFS) traversal?",
+      "options": {
+        "A": "Stack",
+        "B": "Queue",
+        "C": "Priority queue",
+        "D": "Hash table"
+      },
+      "answer": "B",
+      "marks": 1,
+      "negative_marks": 0.33,
+      "explanation": "BFS visits vertices in layers, so a queue is used to process discovered vertices in first-in, first-out order."
+    },
+    {
+      "id": "q2",
+      "type": "MSQ",
+      "subject": "Operating Systems",
+      "question": "Which of the following are necessary conditions for deadlock in the Coffman model?",
+      "options": {
+        "A": "Mutual exclusion",
+        "B": "Hold and wait",
+        "C": "Circular wait",
+        "D": "Unlimited preemption"
+      },
+      "answer": [
+        "A",
+        "B",
+        "C"
+      ],
+      "marks": 2,
+      "negative_marks": 0,
+      "explanation": "The four classic conditions are mutual exclusion, hold and wait, no preemption, and circular wait."
+    },
+    {
+      "id": "q3",
+      "type": "NAT",
+      "subject": "Discrete Mathematics",
+      "question": "A connected tree has 8 vertices. How many edges does it have?",
+      "options": {},
+      "answer": 7,
+      "marks": 1,
+      "negative_marks": 0,
+      "explanation": "A tree with n vertices has n − 1 edges."
+    }
+  ]
+}
