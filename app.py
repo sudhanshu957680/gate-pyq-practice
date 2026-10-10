@@ -1,473 +1,355 @@
 import re
 import time
-from pathlib import Path
-
-import fitz  # PyMuPDF
+import fitz
 import streamlit as st
+from streamlit_autorefresh import st_autorefresh
 
-st.set_page_config(page_title="GATE PYQ Practice", page_icon="📝", layout="wide")
+st.set_page_config(page_title="GATE PYQ CBT", page_icon="📝", layout="wide")
 
+# GATE-inspired CBT layout: clean exam header, question pane, palette and footer.
 st.markdown("""
 <style>
-.block-container {max-width: 1250px; padding-top: 1.4rem;}
-.question-card {padding: 1rem; border: 1px solid rgba(128,128,128,.35); border-radius: 12px; margin: .5rem 0;}
+:root { --navy:#163b67; --blue:#1769aa; --green:#25834a; --red:#c53d3d; --purple:#7650a8; }
+.block-container {max-width: 1500px; padding-top: .7rem; padding-bottom: 1rem;}
+header[data-testid="stHeader"] {height: 2.2rem;}
+.exam-top {background:#173b66;color:#fff;padding:12px 18px;border-radius:8px;margin-bottom:12px;}
+.exam-top h2 {color:#fff;margin:0;font-size:1.25rem;}
+.exam-sub {font-size:.9rem;opacity:.9;margin-top:4px;}
+.panel {border:1px solid #c8d1dc;border-radius:8px;padding:14px;background:var(--secondary-background-color);}
+.question-title {font-size:1.05rem;font-weight:700;margin-bottom:12px;}
+.legend {display:flex;flex-wrap:wrap;gap:10px;font-size:.82rem;margin:8px 0 12px;}
+.legend span {display:inline-flex;align-items:center;gap:5px;}
+.dot {width:11px;height:11px;display:inline-block;border-radius:3px;}
+div.stButton > button {border-radius:6px;min-height:2.5rem;}
+div[data-testid="stRadio"] label {padding:8px 10px;border:1px solid #cfd6df;border-radius:7px;margin-bottom:7px;width:100%;}
+div[data-testid="stRadio"] label:hover {border-color:#1769aa;}
+.small-note {font-size:.82rem;color:gray;}
 </style>
 """, unsafe_allow_html=True)
 
-st.title("📝 GATE PYQ Practice")
-st.caption("Upload a question paper PDF, then its official answer key PDF. Review the extracted content before starting a test.")
-
-def extract_pdf_text(uploaded_file):
-    """Extract selectable text from a PDF in memory. No API key or external service required."""
-    data = uploaded_file.getvalue()
-    doc = fitz.open(stream=data, filetype="pdf")
-    pages = []
-    for page_no, page in enumerate(doc, start=1):
-        pages.append(f"\n\n--- PAGE {page_no} ---\n" + page.get_text("text"))
+def extract_pdf_text(uploaded):
+    doc = fitz.open(stream=uploaded.getvalue(), filetype="pdf")
+    text = "\n".join(page.get_text("text") for page in doc)
     doc.close()
-    return "\n".join(pages).strip()
+    return text.strip()
 
-def split_question_blocks(text):
-    """
-    Heuristic parser for text-based papers.
-    Looks for question numbers at the start of a line, such as '1.', '1)' or 'Q. 1'.
-    PDF layouts vary, so users must review the result.
-    """
-    normalized = text.replace("\r", "\n")
-    pattern = re.compile(r"(?m)^\s*(?:Q(?:uestion)?\s*\.?\s*(\d{1,3})|(\d{1,3})\s*[.)])\s+")
-    matches = list(pattern.finditer(normalized))
+def split_questions(text):
+    # GATE master papers commonly use labels like "Q.1", "Q. 1", sometimes "1."
+    text = text.replace("\r", "\n")
+    pat = re.compile(r"(?m)^\s*(?:Q\s*\.\s*(\d{1,3})|Question\s*(\d{1,3})\s*[:.)]|(\d{1,3})[.)])\s*")
+    matches = list(pat.finditer(text))
     blocks = []
-    for i, match in enumerate(matches):
-        start = match.start()
-        end = matches[i + 1].start() if i + 1 < len(matches) else len(normalized)
-        body = normalized[start:end].strip()
-        # Skip section headings such as "Q.1 – Q.5 Carry ONE mark Each".
-        if re.match(r"^Q(?:uestion)?\s*\.?\s*\d+\s*[–—-]\s*Q?\s*\d+", body, flags=re.I):
-            continue
-        # Exclude obvious page markers and empty chunks
-        if len(body) >= 8:
-            blocks.append((match.group(1) or match.group(2), body))
-    # Keep first occurrence of each question number
-    unique, seen = [], set()
-    for number, body in blocks:
-        if number not in seen:
-            unique.append((number, body))
-            seen.add(number)
-    return unique
+    for i, m in enumerate(matches):
+        n = next((x for x in m.groups() if x), None)
+        end = matches[i+1].start() if i+1 < len(matches) else len(text)
+        block = text[m.end():end].strip()
+        if n and len(block) >= 8:
+            blocks.append({"number":str(int(n)), "raw":block})
+    unique = {}
+    for q in blocks:
+        # Keep first reasonable block per question number; page footer duplicates are discarded.
+        if q["number"] not in unique:
+            unique[q["number"]] = q
+    return list(unique.values())
 
-def parse_options(block):
-    # Common option patterns: (A), A), A., (a)
-    pattern = re.compile(r"(?im)(?:^|\n)\s*\(?([A-D])\)?[.)]\s+")
-    matches = list(pattern.finditer(block))
+def get_options(raw):
+    # Handles (A), (B), (C), (D), and A. / A) styles.
+    pat = re.compile(r"(?im)^\s*\(?([A-D])\)?[.)]\s+")
+    ms = list(pat.finditer(raw))
     options = {}
-    if len(matches) >= 2:
-        for i, m in enumerate(matches):
-            end = matches[i + 1].start() if i + 1 < len(matches) else len(block)
-            value = block[m.end():end].strip()
-            value = re.sub(r"\s+", " ", value)
-            if value:
-                options[m.group(1).upper()] = value
-    return options
-
-def strip_question_number(block):
-    return re.sub(r"^\s*(?:Q(?:uestion)?\.?\s*)?\d{1,3}\s*[.)]\s*", "", block, count=1, flags=re.I).strip()
+    if len(ms) >= 2:
+        for i, m in enumerate(ms):
+            end = ms[i+1].start() if i+1 < len(ms) else len(raw)
+            val = re.sub(r"\s+", " ", raw[m.end():end]).strip()
+            if val:
+                options[m.group(1).upper()] = val
+    if options:
+        first = ms[0].start()
+        stem = raw[:first].strip()
+    else:
+        stem = raw.strip()
+    return stem, options
 
 def parse_answer_key(text):
-    """
-    Parse official GATE answer-key PDFs. PyMuPDF often extracts the table
-    column-by-column as separate lines rather than one row per line, so first
-    recognize the six-cell sequence: Q.No, Session, Type, Section, Key/Range, Marks.
-    Also supports simple one-line keys.
-    """
-    answers, ranges, metadata = {}, {}, {}
-    lines = [re.sub(r"\s+", " ", x).strip() for x in text.splitlines()]
-    lines = [x for x in lines if x]
-
-    def save_row(number, session, qtype, section, key_range, marks):
-        number = str(number)
-        qtype = str(qtype).upper()
-        key_range = str(key_range).strip()
-        metadata[number] = {"type": qtype, "section": str(section), "marks": float(marks), "session": str(session)}
-        if qtype == "NAT":
-            rm = re.match(r"^(-?\d+(?:\.\d+)?)\s+to\s+(-?\d+(?:\.\d+)?)$", key_range, flags=re.I)
-            if rm:
-                low, high = map(float, rm.groups())
-                if low > high:
-                    low, high = high, low
-                ranges[number] = (low, high)
-                answers[number] = (low + high) / 2
+    answers = {}
+    # Common one-line formats: Q.1 A, 1: A, 1 A, 1 = 2.5, 1 A,C
+    patterns = [
+        re.compile(r"(?im)^\s*Q\s*\.?\s*(\d{1,3})\s*[:.)=\-]\s*([A-D](?:\s*[,/]\s*[A-D])*)\s*$"),
+        re.compile(r"(?im)^\s*(\d{1,3})\s*[:.)=\-]\s*([A-D](?:\s*[,/]\s*[A-D])*)\s*$"),
+        re.compile(r"(?im)^\s*(\d{1,3})\s+([A-D](?:\s*[,/]\s*[A-D])*)\s*$"),
+        re.compile(r"(?im)^\s*(?:Q\s*\.?\s*)?(\d{1,3})\s*[:.)=\-]\s*(-?\d+(?:\.\d+)?)\s*$"),
+        re.compile(r"(?im)^\s*(\d{1,3})\s+(-?\d+(?:\.\d+)?)\s*$"),
+    ]
+    for pat in patterns:
+        for m in pat.finditer(text):
+            n, value = m.group(1), m.group(2).strip()
+            if n in answers: continue
+            if re.fullmatch(r"[A-D](?:\s*[,/]\s*[A-D])*", value, re.I):
+                answers[n] = [x.upper() for x in re.split(r"\s*[,/]\s*", value)]
             else:
+                try: answers[n] = float(value)
+                except ValueError: pass
+
+    # Table extraction fallback: GATE answer keys often extract one cell per line.
+    # Detect question number followed nearby by key-like value, but only when a simple row pattern exists.
+    lines = [re.sub(r"\s+", " ", x).strip() for x in text.splitlines() if x.strip()]
+    for i, line in enumerate(lines):
+        m = re.fullmatch(r"(?:Q\s*\.?\s*)?(\d{1,3})", line, re.I)
+        if not m or m.group(1) in answers: continue
+        n = m.group(1)
+        nearby = lines[i+1:min(i+8, len(lines))]
+        for candidate in nearby:
+            if re.fullmatch(r"[A-D](?:\s*[,/]\s*[A-D])*", candidate, re.I):
+                answers[n] = [x.upper() for x in re.split(r"\s*[,/]\s*", candidate)]
+                break
+            if re.fullmatch(r"-?\d+(?:\.\d+)?\s*(?:to|–|-)\s*-?\d+(?:\.\d+)?", candidate, re.I):
+                nums = re.findall(r"-?\d+(?:\.\d+)?", candidate)
+                answers[n] = (float(nums[0]) + float(nums[1])) / 2
+                break
+            if re.fullmatch(r"-?\d+(?:\.\d+)?", candidate):
                 try:
-                    value = float(key_range)
-                    ranges[number] = (value, value)
-                    answers[number] = value
-                except ValueError:
-                    pass
-        elif qtype == "MSQ":
-            letters = re.findall(r"[A-D]", key_range.upper())
-            if letters:
-                answers[number] = list(dict.fromkeys(letters))
-        elif qtype == "MCQ":
-            lm = re.search(r"\b([A-D])\b", key_range.upper())
-            if lm:
-                answers[number] = lm.group(1)
+                    answers[n] = float(candidate)
+                    break
+                except ValueError: pass
+    return answers
 
-    # Standard official table extracted as one cell per line.
-    i = 0
-    while i + 5 < len(lines):
-        if (re.fullmatch(r"\d{1,3}", lines[i])
-            and re.fullmatch(r"\d+", lines[i+1])
-            and lines[i+2].upper() in {"MCQ", "MSQ", "NAT"}
-            and re.fullmatch(r"\d+(?:\.\d+)?", lines[i+5])):
-            save_row(lines[i], lines[i+1], lines[i+2], lines[i+3], lines[i+4], lines[i+5])
-            i += 6
-        else:
-            i += 1
+def answer_text(a):
+    if a is None: return ""
+    if isinstance(a, list): return ",".join(a)
+    return str(a)
 
-    # Fallback for simple line-based keys.
-    if not answers:
-        for line in lines:
-            m = re.match(r"^(?:Q(?:uestion)?\.?\s*)?(\d{1,3})\s*[:.)=]?\s+([A-D](?:\s*[,;/]\s*[A-D])*|-?\d+(?:\.\d+)?(?:\s+to\s+-?\d+(?:\.\d+)?)?)$", line, flags=re.I)
-            if not m:
-                continue
-            number, value = m.groups()
-            value = value.strip()
-            if re.fullmatch(r"[A-D](?:\s*[,;/]\s*[A-D])*", value, flags=re.I):
-                letters = [x.upper() for x in re.split(r"\s*[,;/]\s*", value)]
-                answers[number] = letters if len(letters) > 1 else letters[0]
-            else:
-                rm = re.match(r"^(-?\d+(?:\.\d+)?)\s+to\s+(-?\d+(?:\.\d+)?)$", value, flags=re.I)
-                if rm:
-                    low, high = map(float, rm.groups())
-                    if low > high:
-                        low, high = high, low
-                    ranges[number] = (low, high)
-                    answers[number] = (low + high) / 2
-                else:
-                    try:
-                        v = float(value)
-                        answers[number] = v
-                        ranges[number] = (v, v)
-                    except ValueError:
-                        pass
-    return answers, ranges, metadata
+def parse_answer_value(s, qtype):
+    s = s.strip()
+    if not s: return None
+    if qtype == "NAT":
+        try: return float(s)
+        except ValueError: return None
+    vals = [x.strip().upper() for x in re.split(r"[,/]", s) if x.strip()]
+    return vals if qtype == "MSQ" else (vals[0] if vals else None)
 
-def infer_type(block, answer):
-    if isinstance(answer, list) and len(answer) > 1:
-        return "MSQ"
-    if not parse_options(block):
-        return "NAT"
-    return "MCQ"
+def is_blank(x):
+    return x is None or x == "" or x == []
 
-def make_questions(blocks, answers, ranges, metadata, default_marks, default_negative):
-    questions = []
-    for number, block in blocks:
-        answer = answers.get(number)
-        options = parse_options(block)
-        key_meta = metadata.get(number, {})
-        qtype = key_meta.get("type", infer_type(block, answer))
-        question_text = strip_question_number(block)
-        # If options were recognized, remove their text from the question stem.
-        if options:
-            option_match = re.search(r"(?im)(?:^|\n)\s*\(?A\)?[.)]\s+", question_text)
-            if option_match:
-                question_text = question_text[:option_match.start()].strip()
-        if not question_text:
-            question_text = block
-        questions.append({
-            "id": str(number),
-            "number": str(number),
-            "question": question_text,
-            "type": qtype,
-            "options": options,
-            "answer": answer,
-            "marks": float(key_meta.get("marks", default_marks)),
-            "negative_marks": float(default_negative if qtype == "MCQ" else 0),
-            "subject": key_meta.get("section", "Uncategorized"),
-            "explanation": "",
-            "tolerance": max(0.0, (ranges[number][1] - ranges[number][0]) / 2) if number in ranges else 0.0,
-            "answer_range": ranges.get(number),
-            "raw_block": block,
-        })
-    return questions
-
-def answer_is_empty(value):
-    return value is None or value == "" or value == []
-
-def grade_attempt(questions, answers):
-    score, attempted, correct, wrong, unattempted = 0.0, 0, 0, 0, 0
-    subject_stats = {}
+def score_test(questions, responses):
+    score = 0.0; correct = wrong = attempted = 0
     for q in questions:
-        user_answer = answers.get(q["id"])
-        expected = q.get("answer")
-        subject = q.get("subject") or "Uncategorized"
-        stats = subject_stats.setdefault(subject, {"correct": 0, "wrong": 0, "unattempted": 0, "marks": 0.0})
-        if answer_is_empty(user_answer):
-            unattempted += 1
-            stats["unattempted"] += 1
-            continue
+        ans = responses.get(q["id"])
+        if is_blank(ans): continue
         attempted += 1
-        is_correct = False
+        expected = q["answer"]
+        ok = False
         if q["type"] == "NAT":
-            try:
-                numeric_answer = float(user_answer)
-                answer_range = q.get("answer_range")
-                if answer_range is not None:
-                    is_correct = float(answer_range[0]) <= numeric_answer <= float(answer_range[1])
-                else:
-                    is_correct = abs(numeric_answer - float(expected)) <= float(q.get("tolerance", 0))
-            except (TypeError, ValueError):
-                is_correct = False
+            try: ok = abs(float(ans) - float(expected)) <= q.get("tolerance", 0.0)
+            except (ValueError, TypeError): ok = False
         elif q["type"] == "MSQ":
-            expected_list = expected if isinstance(expected, list) else [expected]
-            is_correct = set(user_answer) == set(expected_list)
+            ok = set(ans if isinstance(ans, list) else [ans]) == set(expected if isinstance(expected, list) else [expected])
         else:
-            is_correct = str(user_answer).upper() == str(expected).upper()
-        if is_correct:
-            score += float(q["marks"])
-            correct += 1
-            stats["correct"] += 1
-            stats["marks"] += float(q["marks"])
+            ok = str(ans).upper() == str(expected).upper()
+        if ok:
+            score += q["marks"]; correct += 1
         else:
-            penalty = float(q.get("negative_marks", 0)) if q["type"] == "MCQ" else 0.0
-            score -= penalty
-            wrong += 1
-            stats["wrong"] += 1
-            stats["marks"] -= penalty
-    return {
-        "score": score, "attempted": attempted, "correct": correct, "wrong": wrong,
-        "unattempted": unattempted, "accuracy": correct / attempted * 100 if attempted else 0,
-        "subjects": subject_stats
-    }
+            score -= q["negative"]; wrong += 1
+    return score, correct, wrong, attempted, len(questions)-attempted
 
-# Sidebar paper metadata
+def build_questions(qtext, atext, marks_1, marks_2, neg):
+    blocks = split_questions(qtext)
+    key = parse_answer_key(atext)
+    out = []
+    for b in blocks:
+        stem, opts = get_options(b["raw"])
+        ans = key.get(b["number"])
+        qtype = "MSQ" if isinstance(ans, list) and len(ans)>1 else ("MCQ" if opts else "NAT")
+        out.append({
+            "id": b["number"], "number": b["number"], "question": stem or b["raw"],
+            "options": opts, "type": qtype, "answer": ans,
+            "marks": float(marks_2 if int(b["number"]) > 10 else marks_1),
+            "negative": float(neg if qtype == "MCQ" else 0),
+            "tolerance": 0.0, "raw": b["raw"]
+        })
+    return out, key
+
+# Session state defaults
+if "prepared_questions" not in st.session_state: st.session_state.prepared_questions = []
+if "responses" not in st.session_state: st.session_state.responses = {}
+if "review" not in st.session_state: st.session_state.review = set()
+if "current" not in st.session_state: st.session_state.current = 0
+if "started_at" not in st.session_state: st.session_state.started_at = None
+if "duration_sec" not in st.session_state: st.session_state.duration_sec = 180*60
+if "submitted" not in st.session_state: st.session_state.submitted = False
+
+st.markdown('<div class="exam-top"><h2>GATE PYQ PRACTICE</h2><div class="exam-sub">Computer-Based Test Practice • Question paper + official answer key</div></div>', unsafe_allow_html=True)
+
 with st.sidebar:
-    st.header("Paper setup")
+    st.header("Test setup")
     year = st.selectbox("GATE year", [str(y) for y in range(2026, 2009, -1)] + ["Older / other"])
-    paper_name = st.selectbox("Paper", ["GATE CSE", "GATE DA", "GATE ECE", "GATE EE", "Other"])
-    session_name = st.text_input("Session / shift (optional)", placeholder="e.g. CSE Session 1")
-    duration_minutes = st.number_input("Test duration (minutes)", min_value=1, max_value=240, value=180, step=5)
-    default_marks = st.selectbox("Default marks per question", [1.0, 2.0], index=0)
-    default_negative = st.selectbox("Default incorrect-MCQ penalty", [0.0, 0.25, 0.33, 0.5, 0.66], index=2)
-    st.caption("Check the official marking scheme. You can correct marks and answers before the test.")
+    paper = st.selectbox("Paper", ["Computer Science (CS)", "Data Science & AI (DA)", "Electronics (EC)", "Electrical (EE)", "Other"])
+    session_name = st.text_input("Session / shift", placeholder="e.g. CS1")
+    duration = st.number_input("Duration (minutes)", min_value=1, max_value=240, value=180, step=5)
+    mark_1 = st.number_input("1-mark question marks", min_value=0.0, max_value=5.0, value=1.0, step=0.5)
+    mark_2 = st.number_input("2-mark question marks", min_value=0.0, max_value=5.0, value=2.0, step=0.5)
+    neg = st.selectbox("MCQ negative marking", [0.0, 0.25, 0.33, 0.5, 0.66], index=2)
+    st.caption("Confirm each paper's official marking scheme before scoring.")
 
-st.header("1. Upload the question paper")
-question_pdf = st.file_uploader("Question paper PDF", type=["pdf"], key="question_pdf")
-if question_pdf:
-    try:
-        extracted_questions = extract_pdf_text(question_pdf)
-        st.session_state["question_pdf_text"] = extracted_questions
-        st.session_state["question_pdf_name"] = question_pdf.name
-        st.success(f"Extracted selectable text from {question_pdf.name}")
-        with st.expander("Preview extracted question-paper text"):
-            st.text_area("Extracted text (read-only preview)", extracted_questions, height=220, disabled=True)
-        if not extracted_questions.strip():
-            st.warning("No selectable text was found. This may be a scanned PDF. This no-API version cannot OCR scanned pages; you will need a text-based PDF or manual entry.")
-    except Exception as exc:
-        st.error(f"Could not read this PDF: {exc}")
-
-st.header("2. Upload the official answer key")
-answer_pdf = st.file_uploader("Official answer key PDF", type=["pdf"], key="answer_pdf")
-if answer_pdf:
-    try:
-        extracted_key = extract_pdf_text(answer_pdf)
-        st.session_state["answer_pdf_text"] = extracted_key
-        st.session_state["answer_pdf_name"] = answer_pdf.name
-        st.success(f"Extracted selectable text from {answer_pdf.name}")
-        with st.expander("Preview extracted answer-key text"):
-            st.text_area("Extracted answer-key text (editable)", extracted_key, height=220, key="answer_text_edit")
-    except Exception as exc:
-        st.error(f"Could not read this answer-key PDF: {exc}")
-
-question_text = st.session_state.get("question_pdf_text", "")
-key_text_default = st.session_state.get("answer_pdf_text", "")
-
-if question_text and key_text_default:
-    st.header("3. Extract and review")
-    st.info("Automatic extraction uses text-layout heuristics. Question numbering and answer-key layouts vary between PDFs. Always verify the extracted questions and answers before starting a scored test.")
-    with st.expander("Edit extracted question text if the PDF parser missed or joined lines", expanded=False):
-        question_text = st.text_area("Question-paper text (editable)", question_text, height=300, key="question_text_edit")
-    key_text = st.session_state.get("answer_text_edit", key_text_default)
-    key_text = st.text_area("Answer-key text (editable; fix entries if needed)", key_text, height=180, key="answer_text_final")
-    blocks = split_question_blocks(question_text)
-    parsed_answers, parsed_ranges, key_metadata = parse_answer_key(key_text)
-    questions = make_questions(blocks, parsed_answers, parsed_ranges, key_metadata, default_marks, default_negative)
-
-    st.write(f"**Detected question blocks:** {len(blocks)} · **Detected answer-key entries:** {len(parsed_answers)}")
-    if not blocks:
-        st.warning("No question blocks were detected. The PDF may have unusual formatting. Edit the extracted question text above or use manual entry below.")
-    if not parsed_answers:
-        st.warning("No answer-key entries were detected. Edit the answer-key text to a recognizable format, such as `1 A`, `2 C`, `3 2.5`, then try again.")
-
-    if questions:
-        # A compact manual review editor: question stem, type, answer, marks, penalty, subject, options as readable JSON-like text.
-        st.markdown("### Review questions and answer mapping")
-        st.caption("Edit question text, answer, type, marks, penalty, and subject below. For MCQ/MSQ answers, use option letters (e.g. B or A,C). For NAT, enter a number.")
-        edited = []
-        for i, q in enumerate(questions):
-            with st.expander(f"Q{q['number']} — {q['question'][:100]}", expanded=(i < 2)):
-                q["question"] = st.text_area("Question text", q["question"], key=f"stem_{q['id']}", height=120)
-                if q["options"]:
-                    st.markdown("**Detected options**")
-                    for letter, option_text in q["options"].items():
-                        st.write(f"{letter}. {option_text}")
-                    option_fix = st.text_area(
-                        "Options (one per line: A: option text)",
-                        "\n".join(f"{k}: {v}" for k, v in q["options"].items()),
-                        key=f"opts_{q['id']}", height=100
-                    )
-                    fixed_options = {}
-                    for line in option_fix.splitlines():
-                        if ":" in line:
-                            letter, value = line.split(":", 1)
-                            letter = letter.strip().upper()
-                            if letter in ["A", "B", "C", "D"] and value.strip():
-                                fixed_options[letter] = value.strip()
-                    q["options"] = fixed_options
-                q["type"] = st.selectbox("Question type", ["MCQ", "MSQ", "NAT"],
-                                         index=["MCQ", "MSQ", "NAT"].index(q["type"]),
-                                         key=f"type_{q['id']}")
-                answer_default = ",".join(q["answer"]) if isinstance(q["answer"], list) else ("" if q["answer"] is None else str(q["answer"]))
-                answer_text = st.text_input("Correct answer from key (edit if needed)", answer_default, key=f"answer_{q['id']}")
-                if q["type"] == "MSQ":
-                    q["answer"] = [x.strip().upper() for x in re.split(r"[,/]", answer_text) if x.strip()]
-                elif q["type"] == "MCQ":
-                    q["answer"] = answer_text.strip().upper() or None
-                else:
-                    try:
-                        q["answer"] = float(answer_text) if answer_text.strip() else None
-                        # If the numeric answer is manually edited, use the entered value exactly.
-                        if q["answer"] is not None and q.get("answer_range") is not None:
-                            low, high = q["answer_range"]
-                            if not (low <= q["answer"] <= high):
-                                q["answer_range"] = (q["answer"], q["answer"])
-                    except ValueError:
-                        q["answer"] = None
-                c1, c2, c3 = st.columns(3)
-                with c1:
-                    q["marks"] = st.number_input("Marks", min_value=0.0, max_value=10.0, value=float(q["marks"]), step=0.5, key=f"marks_{q['id']}")
-                with c2:
-                    q["negative_marks"] = st.number_input("Negative marks (MCQ only)", min_value=0.0, max_value=5.0, value=float(q["negative_marks"]), step=0.01, key=f"neg_{q['id']}")
-                with c3:
-                    q["subject"] = st.text_input("Subject", q["subject"], key=f"subject_{q['id']}")
-                q["explanation"] = st.text_area("Explanation (optional)", q["explanation"], key=f"explain_{q['id']}", height=70)
-                edited.append(q)
-
-        if st.button("Prepare reviewed test", type="primary"):
-            # Validate the answer map before starting.
-            missing = [q["number"] for q in questions if q["answer"] is None or q["answer"] == []]
-            if missing:
-                st.warning("Some questions have no detected answer: " + ", ".join(missing[:30]) + (f" (and {len(missing)-30} more)" if len(missing) > 30 else "") + ". Fill these answers or proceed only after correcting the key.")
-            else:
-                title = f"{paper_name} {year}" + (f" — {session_name}" if session_name.strip() else "")
-                st.session_state["prepared_test"] = {
-                    "title": title, "questions": questions, "duration": int(duration_minutes),
-                    "question_file": st.session_state.get("question_pdf_name", ""),
-                    "answer_file": st.session_state.get("answer_pdf_name", "")
-                }
-                st.success("Reviewed test prepared. Scroll to the test section below.")
+# Setup/upload view until user prepares a test
+if not st.session_state.prepared_questions:
+    st.subheader("Prepare your paper")
+    c1, c2 = st.columns(2)
+    with c1:
+        qpdf = st.file_uploader("1. Upload question paper PDF", type=["pdf"], key="qpdf")
+    with c2:
+        apdf = st.file_uploader("2. Upload official answer key PDF", type=["pdf"], key="apdf")
+    if qpdf and apdf:
+        try:
+            qtext = extract_pdf_text(qpdf)
+            atext = extract_pdf_text(apdf)
+            with st.expander("Preview extracted question text"):
+                st.text_area("Question paper text", qtext, height=180, key="qtext_preview")
+            with st.expander("Preview / correct answer-key text", expanded=True):
+                atext = st.text_area("Answer-key text", atext, height=180, key="atext_edit")
+            questions, key = build_questions(qtext, atext, mark_1, mark_2, neg)
+            st.info(f"Detected {len(questions)} question blocks and {len(key)} answer-key entries. Review the extracted text before starting.")
+            if questions:
+                with st.expander("Review detected questions", expanded=False):
+                    for q in questions:
+                        st.markdown(f"**Q{q['number']}** — {q['question'][:220]}")
+                        st.caption(f"Options detected: {len(q['options'])} • Key answer: {answer_text(q['answer']) or 'NOT DETECTED'}")
+            if st.button("Prepare CBT test", type="primary", use_container_width=True):
+                st.session_state.prepared_questions = questions
+                st.session_state.paper_title = f"GATE {paper} {year}" + (f" — {session_name}" if session_name else "")
+                st.session_state.duration_sec = int(duration*60)
+                st.session_state.responses = {}
+                st.session_state.review = set()
+                st.session_state.current = 0
+                st.session_state.started_at = None
+                st.session_state.submitted = False
                 st.rerun()
+        except Exception as e:
+            st.error(f"Could not process one of the PDFs: {e}")
+    else:
+        st.caption("Upload both PDFs to extract text. Scanned/image-only PDFs need OCR and are not supported in this no-API version.")
+    st.stop()
 
-st.header("4. Take the timed test")
-prepared = st.session_state.get("prepared_test")
-if not prepared:
-    st.info("Upload both PDFs, review the extraction, and click **Prepare reviewed test** to enable the test.")
-else:
-    st.write(f"**{prepared['title']}** · {len(prepared['questions'])} questions · {prepared['duration']} minutes")
-    if st.button("Start / restart test", type="primary"):
-        st.session_state["attempt"] = {
-            "answers": {}, "index": 0, "marked": set(), "start": time.time(),
-            "duration": prepared["duration"] * 60, "submitted": False,
-            "questions": prepared["questions"], "title": prepared["title"]
-        }
+# Exam view
+questions = st.session_state.prepared_questions
+if not questions:
+    st.error("No questions were extracted. Clear the test and upload text-based PDFs with selectable text.")
+    if st.button("Back to setup"): st.session_state.prepared_questions=[]; st.rerun()
+    st.stop()
+
+if st.session_state.started_at is None and not st.session_state.submitted:
+    st.subheader(st.session_state.get("paper_title", "GATE Practice Test"))
+    st.write(f"**{len(questions)} questions** • **{st.session_state.duration_sec//60} minutes**")
+    st.warning("Before starting, verify question extraction and answer-key mapping. Do not use scores until all answers are checked.")
+    if st.button("Start examination", type="primary"):
+        st.session_state.started_at = time.time()
         st.rerun()
+    if st.button("Return to upload / reset"):
+        st.session_state.prepared_questions=[]
+        st.rerun()
+    st.stop()
 
-    attempt = st.session_state.get("attempt")
-    if attempt:
-        remaining = max(0, attempt["duration"] - int(time.time() - attempt["start"]))
-        if remaining == 0 and not attempt["submitted"]:
-            attempt["submitted"] = True
-            attempt["auto_submitted"] = True
+if st.session_state.submitted:
+    score, correct, wrong, attempted, unattempted = score_test(questions, st.session_state.responses)
+    st.success("Test submitted.")
+    m1,m2,m3,m4 = st.columns(4)
+    m1.metric("Score (estimated)", f"{score:.2f}")
+    m2.metric("Correct", correct)
+    m3.metric("Wrong", wrong)
+    m4.metric("Unattempted", unattempted)
+    st.caption("Estimated score uses the marks and answer key imported into this app. Verify the official marking scheme and key.")
+    for q in questions:
+        with st.expander(f"Q{q['number']} — review"):
+            st.write(q["question"])
+            st.write("Your answer:", st.session_state.responses.get(q["id"], "Not answered"))
+            st.write("Key answer:", answer_text(q["answer"]) or "Not detected")
+            for letter, opt in q["options"].items(): st.write(f"{letter}. {opt}")
+    if st.button("Start another paper"):
+        for k in ["prepared_questions","responses","review","current","started_at","submitted"]:
+            st.session_state.pop(k, None)
+        st.rerun()
+    st.stop()
 
-        if attempt["submitted"]:
-            result = grade_attempt(attempt["questions"], attempt["answers"])
-            st.success("Time expired; test auto-submitted." if attempt.get("auto_submitted") else "Test submitted.")
-            a, b, c, d = st.columns(4)
-            a.metric("Score", f"{result['score']:.2f}")
-            b.metric("Attempted", f"{result['attempted']}/{len(attempt['questions'])}")
-            c.metric("Accuracy", f"{result['accuracy']:.1f}%")
-            d.metric("Correct / wrong", f"{result['correct']} / {result['wrong']}")
-            st.subheader("Subject-wise summary")
-            st.dataframe([{"Subject": k, **v} for k, v in result["subjects"].items()], use_container_width=True, hide_index=True)
-            st.subheader("Review answers")
-            for i, q in enumerate(attempt["questions"], start=1):
-                with st.expander(f"Q{q['number']} — {q['question'][:100]}"):
-                    st.write("Your answer:", attempt["answers"].get(q["id"], "Not attempted"))
-                    st.write("Correct answer:", q.get("answer", "Not available"))
-                    if q.get("explanation"):
-                        st.write("Explanation:", q["explanation"])
-                    if q.get("options"):
-                        for letter, value in q["options"].items():
-                            st.write(f"{letter}. {value}")
-            if st.button("Clear attempt"):
-                st.session_state.pop("attempt", None)
-                st.rerun()
-        else:
-            mins, secs = divmod(remaining, 60)
-            st.metric("Time remaining", f"{mins:02d}:{secs:02d}")
-            st.progress(max(0.0, min(1.0, remaining / attempt["duration"])))
-            qs = attempt["questions"]
-            idx = min(attempt["index"], len(qs) - 1)
-            q = qs[idx]
-            st.markdown(f"### Question {idx + 1} of {len(qs)} · {q['type']} · {q['marks']} mark(s)")
-            st.markdown('<div class="question-card">', unsafe_allow_html=True)
-            st.markdown(q["question"])
-            st.markdown('</div>', unsafe_allow_html=True)
-            qid = q["id"]
-            existing = attempt["answers"].get(qid)
-            if q["type"] == "NAT":
-                val = st.text_input("Numerical answer", value="" if existing is None else str(existing), key=f"test_nat_{qid}")
-                attempt["answers"][qid] = val.strip() if val.strip() else None
-            elif q["type"] == "MSQ":
-                options = q["options"]
-                selected = st.multiselect("Select all correct options", list(options.keys()),
-                    default=existing if isinstance(existing, list) else [],
-                    format_func=lambda k: f"{k}. {options[k]}", key=f"test_msq_{qid}")
-                attempt["answers"][qid] = selected or None
-            else:
-                options = q["options"]
-                keys = list(options.keys())
-                selected = st.radio("Choose one answer", keys,
-                    index=keys.index(existing) if existing in keys else None,
-                    format_func=lambda k: f"{k}. {options[k]}", key=f"test_mcq_{qid}")
-                attempt["answers"][qid] = selected
-            marked = st.checkbox("Mark for review", value=qid in attempt["marked"], key=f"test_mark_{qid}")
-            if marked:
-                attempt["marked"].add(qid)
-            else:
-                attempt["marked"].discard(qid)
-            c1, c2, c3 = st.columns(3)
-            with c1:
-                if st.button("← Previous", disabled=idx == 0, use_container_width=True):
-                    attempt["index"] = idx - 1
-                    st.rerun()
-            with c2:
-                if st.button("Next →", disabled=idx >= len(qs)-1, use_container_width=True):
-                    attempt["index"] = idx + 1
-                    st.rerun()
-            with c3:
-                if st.button("Submit test", type="primary", use_container_width=True):
-                    attempt["submitted"] = True
-                    st.rerun()
-            st.markdown("**Question palette**")
-            palette_cols = st.columns(8)
-            for i, item in enumerate(qs):
-                answered = not answer_is_empty(attempt["answers"].get(item["id"]))
-                label = f"{i+1}{' ✓' if answered else ''}{' ⚑' if item['id'] in attempt['marked'] else ''}"
-                with palette_cols[i % 8]:
-                    if st.button(label, key=f"palette_{i}", use_container_width=True):
-                        attempt["index"] = i
-                        st.rerun()
+st_autorefresh(interval=1000, key="exam_timer_refresh")
+remaining = max(0, st.session_state.duration_sec - int(time.time()-st.session_state.started_at))
+if remaining <= 0:
+    st.session_state.submitted = True
+    st.rerun()
 
+# Header status
+mins, secs = divmod(remaining, 60)
+top1, top2, top3 = st.columns([5,2,2])
+with top1:
+    st.markdown(f"### {st.session_state.get('paper_title','GATE Practice Test')}")
+    st.caption("Choose the most appropriate answer. Use Mark for Review when needed.")
+with top2:
+    st.metric("Time left", f"{mins:02d}:{secs:02d}")
+with top3:
+    st.metric("Question", f"{st.session_state.current+1} / {len(questions)}")
+
+st.progress(remaining / st.session_state.duration_sec)
 st.divider()
-st.caption("PDF extraction runs locally within the hosted app process using PyMuPDF; no external AI API is used. Scanned PDFs need OCR, which is not included. Always verify extracted text, question numbering, options, answer mapping, and marking scheme.")
+
+# Two-column CBT layout
+left, right = st.columns([3.5, 1.15], gap="large")
+idx = min(st.session_state.current, len(questions)-1)
+q = questions[idx]
+with left:
+    st.markdown(f'<div class="panel"><div class="question-title">Question {idx+1} <span style="font-weight:400;color:#667085">| {q["type"]} | {q["marks"]:g} mark(s)</span></div></div>', unsafe_allow_html=True)
+    st.markdown(q["question"] if q["question"].strip() else "_Question text was not extracted. Return to setup and inspect the PDF text._")
+    if not q["question"].strip():
+        st.warning("This question has no extracted text. The PDF may use a layout that needs manual correction.")
+    qid = q["id"]
+    opts = q["options"]
+    if q["type"] == "NAT" or not opts:
+        prior = st.session_state.responses.get(qid, "")
+        response = st.text_input("Enter numerical answer", value=str(prior) if prior is not None else "", key=f"nat_{qid}")
+        st.session_state.responses[qid] = response.strip() if response.strip() else None
+    elif q["type"] == "MSQ":
+        prior = st.session_state.responses.get(qid, [])
+        response = st.multiselect("Select all correct options", list(opts.keys()), default=prior if isinstance(prior,list) else [], format_func=lambda k: f"{k}. {opts[k]}", key=f"msq_{qid}")
+        st.session_state.responses[qid] = response or None
+    else:
+        keys = list(opts.keys())
+        prior = st.session_state.responses.get(qid)
+        response = st.radio("Select one answer", keys, index=keys.index(prior) if prior in keys else None, format_func=lambda k: f"{k}. {opts[k]}", key=f"mcq_{qid}")
+        st.session_state.responses[qid] = response
+    st.divider()
+    b1,b2,b3,b4 = st.columns([1.2,1.5,1.5,1.5])
+    with b1:
+        if st.button("← Previous", disabled=idx==0, use_container_width=True):
+            st.session_state.current -= 1; st.rerun()
+    with b2:
+        if st.button("Clear response", use_container_width=True):
+            st.session_state.responses[qid] = None; st.rerun()
+    with b3:
+        if st.button("Mark for review", use_container_width=True):
+            st.session_state.review.add(qid); st.session_state.current = min(idx+1,len(questions)-1); st.rerun()
+    with b4:
+        if st.button("Save & Next", type="primary", use_container_width=True):
+            st.session_state.current = min(idx+1,len(questions)-1); st.rerun()
+
+with right:
+    st.markdown('<div class="panel"><div class="question-title">Question Palette</div></div>', unsafe_allow_html=True)
+    st.markdown("""
+    <div class="legend">
+    <span><i class="dot" style="background:#25834a"></i>Answered</span>
+    <span><i class="dot" style="background:#7650a8"></i>Review</span>
+    <span><i class="dot" style="background:#d5dbe3"></i>Not answered</span>
+    </div>
+    """, unsafe_allow_html=True)
+    cols = st.columns(5)
+    for i, item in enumerate(questions):
+        qid2 = item["id"]
+        ans = st.session_state.responses.get(qid2)
+        if qid2 in st.session_state.review: label = f"⚑ {i+1}"
+        elif not is_blank(ans): label = f"✓ {i+1}"
+        else: label = str(i+1)
+        with cols[i % 5]:
+            if st.button(label, key=f"jump_{i}", use_container_width=True):
+                st.session_state.current = i; st.rerun()
+    st.divider()
+    st.caption(f"Answered: {sum(not is_blank(st.session_state.responses.get(x['id'])) for x in questions)} / {len(questions)}")
+    if st.button("Submit examination", type="primary", use_container_width=True):
+        st.session_state.submitted = True; st.rerun()
+
+
