@@ -23,9 +23,9 @@ def extract_pdf_text(uploaded_file):
     doc = fitz.open(stream=data, filetype="pdf")
     pages = []
     for page_no, page in enumerate(doc, start=1):
-        pages.append(f"\\n\\n--- PAGE {page_no} ---\\n" + page.get_text("text"))
+        pages.append(f"\n\n--- PAGE {page_no} ---\n" + page.get_text("text"))
     doc.close()
-    return "\\n".join(pages).strip()
+    return "\n".join(pages).strip()
 
 def split_question_blocks(text):
     """
@@ -33,17 +33,20 @@ def split_question_blocks(text):
     Looks for question numbers at the start of a line, such as '1.', '1)' or 'Q. 1'.
     PDF layouts vary, so users must review the result.
     """
-    normalized = text.replace("\\r", "\\n")
-    pattern = re.compile(r"(?m)^\\s*(?:Q(?:uestion)?\\s*)?(\\d{1,3})\\s*[.)]\\s+")
+    normalized = text.replace("\r", "\n")
+    pattern = re.compile(r"(?m)^\s*(?:Q(?:uestion)?\s*\.?\s*(\d{1,3})|(\d{1,3})\s*[.)])\s+")
     matches = list(pattern.finditer(normalized))
     blocks = []
     for i, match in enumerate(matches):
         start = match.start()
         end = matches[i + 1].start() if i + 1 < len(matches) else len(normalized)
         body = normalized[start:end].strip()
+        # Skip section headings such as "Q.1 – Q.5 Carry ONE mark Each".
+        if re.match(r"^Q(?:uestion)?\s*\.?\s*\d+\s*[–—-]\s*Q?\s*\d+", body, flags=re.I):
+            continue
         # Exclude obvious page markers and empty chunks
         if len(body) >= 8:
-            blocks.append((match.group(1), body))
+            blocks.append((match.group(1) or match.group(2), body))
     # Keep first occurrence of each question number
     unique, seen = [], set()
     for number, body in blocks:
@@ -54,20 +57,20 @@ def split_question_blocks(text):
 
 def parse_options(block):
     # Common option patterns: (A), A), A., (a)
-    pattern = re.compile(r"(?im)(?:^|\\n)\\s*\\(?([A-D])\\)?[.)]\\s+")
+    pattern = re.compile(r"(?im)(?:^|\n)\s*\(?([A-D])\)?[.)]\s+")
     matches = list(pattern.finditer(block))
     options = {}
     if len(matches) >= 2:
         for i, m in enumerate(matches):
             end = matches[i + 1].start() if i + 1 < len(matches) else len(block)
             value = block[m.end():end].strip()
-            value = re.sub(r"\\s+", " ", value)
+            value = re.sub(r"\s+", " ", value)
             if value:
                 options[m.group(1).upper()] = value
     return options
 
 def strip_question_number(block):
-    return re.sub(r"^\\s*(?:Q(?:uestion)?\\s*)?\\d{1,3}\\s*[.)]\\s*", "", block, count=1, flags=re.I).strip()
+    return re.sub(r"^\s*(?:Q(?:uestion)?\.?\s*)?\d{1,3}\s*[.)]\s*", "", block, count=1, flags=re.I).strip()
 
 def parse_answer_key(text):
     """
@@ -80,17 +83,17 @@ def parse_answer_key(text):
     """
     answers = {}
     patterns = [
-        re.compile(r"(?im)^\\s*(?:Q(?:uestion)?\\s*)?(\\d{1,3})\\s*[:.)=\\-]\\s*([A-D](?:\\s*[,/]\\s*[A-D])*)\\s*$"),
-        re.compile(r"(?im)^\\s*(?:Q(?:uestion)?\\s*)?(\\d{1,3})\\s+([A-D](?:\\s*[,/]\\s*[A-D])*)\\s*$"),
-        re.compile(r"(?im)^\\s*(?:Q(?:uestion)?\\s*)?(\\d{1,3})\\s*[:.)=\\-]\\s*(-?\\d+(?:\\.\\d+)?)\\s*$"),
-        re.compile(r"(?im)^\\s*(?:Q(?:uestion)?\\s*)?(\\d{1,3})\\s+(-?\\d+(?:\\.\\d+)?)\\s*$"),
+        re.compile(r"(?im)^\s*(?:Q(?:uestion)?\.?\s*)?(\d{1,3})\s*[:.)=\-]\s*([A-D](?:\s*[,/]\s*[A-D])*)\s*$"),
+        re.compile(r"(?im)^\s*(?:Q(?:uestion)?\.?\s*)?(\d{1,3})\s+([A-D](?:\s*[,/]\s*[A-D])*)\s*$"),
+        re.compile(r"(?im)^\s*(?:Q(?:uestion)?\.?\s*)?(\d{1,3})\s*[:.)=\-]\s*(-?\d+(?:\.\d+)?)\s*$"),
+        re.compile(r"(?im)^\s*(?:Q(?:uestion)?\.?\s*)?(\d{1,3})\s+(-?\d+(?:\.\d+)?)\s*$"),
     ]
     for pattern in patterns:
         for m in pattern.finditer(text):
             number, answer = m.group(1), m.group(2).strip()
             if number not in answers:
-                if re.fullmatch(r"[A-D](?:\\s*[,/]\\s*[A-D])*", answer, flags=re.I):
-                    answers[number] = [x.upper() for x in re.split(r"\\s*[,/]\\s*", answer)]
+                if re.fullmatch(r"[A-D](?:\s*[,/]\s*[A-D])*", answer, flags=re.I):
+                    answers[number] = [x.upper() for x in re.split(r"\s*[,/]\s*", answer)]
                 else:
                     try:
                         answers[number] = float(answer)
@@ -114,7 +117,7 @@ def make_questions(blocks, answers, default_marks, default_negative):
         question_text = strip_question_number(block)
         # If options were recognized, remove their text from the question stem.
         if options:
-            option_match = re.search(r"(?im)(?:^|\\n)\\s*\\(?A\\)?[.)]\\s+", question_text)
+            option_match = re.search(r"(?im)(?:^|\n)\s*\(?A\)?[.)]\s+", question_text)
             if option_match:
                 question_text = question_text[:option_match.start()].strip()
         if not question_text:
@@ -251,7 +254,7 @@ if question_text and key_text_default:
                         st.write(f"{letter}. {option_text}")
                     option_fix = st.text_area(
                         "Options (one per line: A: option text)",
-                        "\\n".join(f"{k}: {v}" for k, v in q["options"].items()),
+                        "\n".join(f"{k}: {v}" for k, v in q["options"].items()),
                         key=f"opts_{q['id']}", height=100
                     )
                     fixed_options = {}
