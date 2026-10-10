@@ -74,32 +74,83 @@ def strip_question_number(block):
 
 def parse_answer_key(text):
     """
-    Best-effort answer-key parser. Supports common text formats such as:
-    1 A
-    Q1: B
-    2. C
-    4 = 3.14
-    For MSQ keys, formats such as '5: A,C' may be recognized.
+    Parse official GATE answer-key PDFs. PyMuPDF often extracts the table
+    column-by-column as separate lines rather than one row per line, so first
+    recognize the six-cell sequence: Q.No, Session, Type, Section, Key/Range, Marks.
+    Also supports simple one-line keys.
     """
-    answers = {}
-    patterns = [
-        re.compile(r"(?im)^\s*(?:Q(?:uestion)?\.?\s*)?(\d{1,3})\s*[:.)=\-]\s*([A-D](?:\s*[,/]\s*[A-D])*)\s*$"),
-        re.compile(r"(?im)^\s*(?:Q(?:uestion)?\.?\s*)?(\d{1,3})\s+([A-D](?:\s*[,/]\s*[A-D])*)\s*$"),
-        re.compile(r"(?im)^\s*(?:Q(?:uestion)?\.?\s*)?(\d{1,3})\s*[:.)=\-]\s*(-?\d+(?:\.\d+)?)\s*$"),
-        re.compile(r"(?im)^\s*(?:Q(?:uestion)?\.?\s*)?(\d{1,3})\s+(-?\d+(?:\.\d+)?)\s*$"),
-    ]
-    for pattern in patterns:
-        for m in pattern.finditer(text):
-            number, answer = m.group(1), m.group(2).strip()
-            if number not in answers:
-                if re.fullmatch(r"[A-D](?:\s*[,/]\s*[A-D])*", answer, flags=re.I):
-                    answers[number] = [x.upper() for x in re.split(r"\s*[,/]\s*", answer)]
+    answers, ranges, metadata = {}, {}, {}
+    lines = [re.sub(r"\s+", " ", x).strip() for x in text.splitlines()]
+    lines = [x for x in lines if x]
+
+    def save_row(number, session, qtype, section, key_range, marks):
+        number = str(number)
+        qtype = str(qtype).upper()
+        key_range = str(key_range).strip()
+        metadata[number] = {"type": qtype, "section": str(section), "marks": float(marks), "session": str(session)}
+        if qtype == "NAT":
+            rm = re.match(r"^(-?\d+(?:\.\d+)?)\s+to\s+(-?\d+(?:\.\d+)?)$", key_range, flags=re.I)
+            if rm:
+                low, high = map(float, rm.groups())
+                if low > high:
+                    low, high = high, low
+                ranges[number] = (low, high)
+                answers[number] = (low + high) / 2
+            else:
+                try:
+                    value = float(key_range)
+                    ranges[number] = (value, value)
+                    answers[number] = value
+                except ValueError:
+                    pass
+        elif qtype == "MSQ":
+            letters = re.findall(r"[A-D]", key_range.upper())
+            if letters:
+                answers[number] = list(dict.fromkeys(letters))
+        elif qtype == "MCQ":
+            lm = re.search(r"\b([A-D])\b", key_range.upper())
+            if lm:
+                answers[number] = lm.group(1)
+
+    # Standard official table extracted as one cell per line.
+    i = 0
+    while i + 5 < len(lines):
+        if (re.fullmatch(r"\d{1,3}", lines[i])
+            and re.fullmatch(r"\d+", lines[i+1])
+            and lines[i+2].upper() in {"MCQ", "MSQ", "NAT"}
+            and re.fullmatch(r"\d+(?:\.\d+)?", lines[i+5])):
+            save_row(lines[i], lines[i+1], lines[i+2], lines[i+3], lines[i+4], lines[i+5])
+            i += 6
+        else:
+            i += 1
+
+    # Fallback for simple line-based keys.
+    if not answers:
+        for line in lines:
+            m = re.match(r"^(?:Q(?:uestion)?\.?\s*)?(\d{1,3})\s*[:.)=]?\s+([A-D](?:\s*[,;/]\s*[A-D])*|-?\d+(?:\.\d+)?(?:\s+to\s+-?\d+(?:\.\d+)?)?)$", line, flags=re.I)
+            if not m:
+                continue
+            number, value = m.groups()
+            value = value.strip()
+            if re.fullmatch(r"[A-D](?:\s*[,;/]\s*[A-D])*", value, flags=re.I):
+                letters = [x.upper() for x in re.split(r"\s*[,;/]\s*", value)]
+                answers[number] = letters if len(letters) > 1 else letters[0]
+            else:
+                rm = re.match(r"^(-?\d+(?:\.\d+)?)\s+to\s+(-?\d+(?:\.\d+)?)$", value, flags=re.I)
+                if rm:
+                    low, high = map(float, rm.groups())
+                    if low > high:
+                        low, high = high, low
+                    ranges[number] = (low, high)
+                    answers[number] = (low + high) / 2
                 else:
                     try:
-                        answers[number] = float(answer)
+                        v = float(value)
+                        answers[number] = v
+                        ranges[number] = (v, v)
                     except ValueError:
                         pass
-    return answers
+    return answers, ranges, metadata
 
 def infer_type(block, answer):
     if isinstance(answer, list) and len(answer) > 1:
@@ -108,12 +159,13 @@ def infer_type(block, answer):
         return "NAT"
     return "MCQ"
 
-def make_questions(blocks, answers, default_marks, default_negative):
+def make_questions(blocks, answers, ranges, metadata, default_marks, default_negative):
     questions = []
     for number, block in blocks:
         answer = answers.get(number)
         options = parse_options(block)
-        qtype = infer_type(block, answer)
+        key_meta = metadata.get(number, {})
+        qtype = key_meta.get("type", infer_type(block, answer))
         question_text = strip_question_number(block)
         # If options were recognized, remove their text from the question stem.
         if options:
@@ -129,10 +181,12 @@ def make_questions(blocks, answers, default_marks, default_negative):
             "type": qtype,
             "options": options,
             "answer": answer,
-            "marks": float(default_marks),
+            "marks": float(key_meta.get("marks", default_marks)),
             "negative_marks": float(default_negative if qtype == "MCQ" else 0),
-            "subject": "Uncategorized",
+            "subject": key_meta.get("section", "Uncategorized"),
             "explanation": "",
+            "tolerance": max(0.0, (ranges[number][1] - ranges[number][0]) / 2) if number in ranges else 0.0,
+            "answer_range": ranges.get(number),
             "raw_block": block,
         })
     return questions
@@ -156,7 +210,12 @@ def grade_attempt(questions, answers):
         is_correct = False
         if q["type"] == "NAT":
             try:
-                is_correct = abs(float(user_answer) - float(expected)) <= float(q.get("tolerance", 0))
+                numeric_answer = float(user_answer)
+                answer_range = q.get("answer_range")
+                if answer_range is not None:
+                    is_correct = float(answer_range[0]) <= numeric_answer <= float(answer_range[1])
+                else:
+                    is_correct = abs(numeric_answer - float(expected)) <= float(q.get("tolerance", 0))
             except (TypeError, ValueError):
                 is_correct = False
         elif q["type"] == "MSQ":
@@ -231,8 +290,8 @@ if question_text and key_text_default:
     key_text = st.session_state.get("answer_text_edit", key_text_default)
     key_text = st.text_area("Answer-key text (editable; fix entries if needed)", key_text, height=180, key="answer_text_final")
     blocks = split_question_blocks(question_text)
-    parsed_answers = parse_answer_key(key_text)
-    questions = make_questions(blocks, parsed_answers, default_marks, default_negative)
+    parsed_answers, parsed_ranges, key_metadata = parse_answer_key(key_text)
+    questions = make_questions(blocks, parsed_answers, parsed_ranges, key_metadata, default_marks, default_negative)
 
     st.write(f"**Detected question blocks:** {len(blocks)} · **Detected answer-key entries:** {len(parsed_answers)}")
     if not blocks:
@@ -277,6 +336,11 @@ if question_text and key_text_default:
                 else:
                     try:
                         q["answer"] = float(answer_text) if answer_text.strip() else None
+                        # If the numeric answer is manually edited, use the entered value exactly.
+                        if q["answer"] is not None and q.get("answer_range") is not None:
+                            low, high = q["answer_range"]
+                            if not (low <= q["answer"] <= high):
+                                q["answer_range"] = (q["answer"], q["answer"])
                     except ValueError:
                         q["answer"] = None
                 c1, c2, c3 = st.columns(3)
